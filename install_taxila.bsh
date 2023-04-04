@@ -1,0 +1,156 @@
+#
+# Passo a passo para instalar o docker, baixar uma imagem do fedora 26 e instalar o OpenMPI, PETSc e TAXILA
+#
+# Se seu sistema operacional não for o fedora, os comandos para instalar os pacotes podem mudar.
+# Modifique de acordo.
+#
+
+# ----------------------------------------------
+# Docker
+#
+
+dnf install moby-engine
+systemctl enable --now docker
+echo '%docker        ALL=(ALL)       NOPASSWD: /usr/bin/docker' > /etc/sudoers.d/docker
+usermod -a -G docker alberto
+
+# baixa uma image docker do fedora 26
+docker pull fedora:26
+
+# cria um container a partir da imagem
+docker run -it --name my_taxila_container fedora:26 /bin/bash
+
+# ----------------------------------------------
+# dentro da imagem do docker:
+#
+
+dnf install gcc gcc-gfortran make wget git gcc-c++ hwloc findutils hostname lapack-devel openblas-openmp texinfo valgrind-devel python2 fftw
+
+# --------------------
+# openmpi
+#
+
+cd /home
+wget https://download.open-mpi.org/release/open-mpi/v3.1/openmpi-3.1.2.tar.gz
+tar -xzf openmpi-3.1.2.tar.gz
+cd openmpi-3.1.2
+./configure --prefix=/opt/openmpi-3.1.2 --enable-mpi-cxx --enable-shared --enable-static
+make -j8
+make install
+
+cat << EOF > /etc/profile.d/cluster.sh
+export OMPI_ROOT=/opt/openmpi-3.1.2
+export LD_LIBRARY_PATH=\${OMPI_ROOT}/lib:\$LD_LIBRARY_PATH
+export PATH=\${OMPI_ROOT}/bin:\$PATH
+export MANPATH=\${OMPI_ROOT}/share/man:\$MANPATH
+export CPATH=\${OMPI_ROOT}/include:\$CPATH
+EOF
+
+source /etc/profile.d/cluster.sh
+
+# --------------------
+# petsc
+#
+
+cd /home
+wget https://ftp.mcs.anl.gov/pub/petsc/release-snapshots/petsc-3.4.4.tar.gz
+tar -xzf petsc-3.4.4.tar.gz
+cd petsc-3.4.4
+# include sched.h
+sed -i '/^#include <petsc-private\/threadcommimpl\.h>/i #include <sched.h>' ./src/sys/threadcomm/impls/openmp/tcopenmpimpl.h
+./configure --with-x=0 --with-fortran-interfaces --with-shared-libraries --with-debugging --prefix=/opt/petsc-3.4.4
+
+make PETSC_DIR=/home/petsc-3.4.4 PETSC_ARCH=arch-linux2-c-debug all -j4
+make PETSC_DIR=/home/petsc-3.4.4 PETSC_ARCH=arch-linux2-c-debug install
+
+# Versão otimizada com instruções presentes na maioria dos procesadores modernos.
+# Poderiam ser criadas imagens com otimizações para cada família de processadores que há nas máquinas do grupo.
+./configure --with-x=0 --with-fortran-interfaces --with-shared-libraries --with-debugging=0 --prefix=/opt/petsc-opt-3.4.4 --with-memalign=64 --COPTFLAGS='-O3 -mavx -mavx2 -msse2 -msse4.2 -msse4.1 -mssse3 -mfma' --CXXOPTFLAGS='-O3 -mavx -mavx2 -msse2 -msse4.2 -msse4.1 -mssse3 -mfma' --FCOPTFLAGS='-O3 -mavx -mavx2 -msse2 -msse4.2 -msse4.1 -mssse3 -mfma'
+
+make PETSC_DIR=/home/petsc-3.4.4 PETSC_ARCH=arch-linux2-c-opt all -j4
+make PETSC_DIR=/home/petsc-3.4.4 PETSC_ARCH=arch-linux2-c-opt install
+
+cat << EOF > /opt/load-petsc-opt.sh
+export PETSC_DIR=/opt/petsc-opt-3.4.4
+EOF
+
+
+# --------------------
+# taxila
+#
+
+cd /home
+git clone https://github.com/wellingtonluiztj/TAXILA-Install.git
+cp -r TAXILA-Install/taxila-font-Mar14 /home/taxila
+cd /home/taxila/src/lbm
+source /opt/load-petsc-debug.sh
+make
+
+cat << EOF > /opt/load-taxila-debug.sh
+export PETSC_DIR=/opt/petsc-3.4.4
+export LBM_DIR=/home/taxila
+EOF
+
+cd /home
+cp -r TAXILA-Install/taxila-font-Mar14 /home/taxila-opt
+cd /home/taxila-opt/src/lbm
+source /opt/load-petsc-opt.sh
+# Se necessário, edite o Makefile e inclua as flags de otimização para o caso LBM_OPT não vazio.
+LBM_OPT=1 make
+
+cat << EOF > /opt/load-taxila-opt.sh
+export PETSC_DIR=/opt/petsc-opt-3.4.4
+export LBM_DIR=/home/taxila-opt
+EOF
+
+# --------------------
+# sai do container do docker
+#
+exit
+
+
+# ----------------------------------------------
+# Cria nova imagem docker a partir do container
+#
+
+# exporta (isso reduz a imagem)
+docker container export -o taxila-container my_taxila_container
+
+# importa de novo e salva como imagem
+docker import taxila-container taxila
+
+# salva a imagem em .tar
+docker save -o taxila_docker_img.tar taxila
+gzip build_my_taxila_apptainer_image.bsh
+
+
+# ----------------------------------------------
+# Cria nova imagem apptainer a partir da imagem docker
+#
+echo '
+#!/bin/bash
+
+IMAGE_PATH="./"
+DOCKER_IMAGE_FILE="taxila_docker_img.tar.gz"
+MY_CONTAINER_NAME="taxila"
+MY_APPTAINER_IMAGE="${MY_CONTAINER_NAME}.sif"
+
+cp ${IMAGE_PATH}/${DOCKER_IMAGE_FILE} ./
+gunzip ${DOCKER_IMAGE_FILE} 
+apptainer build --fakeroot ${MY_APPTAINER_IMAGE} docker-archive://${DOCKER_IMAGE_FILE/\.gz/}
+#rm -f ${DOCKER_IMAGE_FILE/\.gz/}
+
+echo ""
+echo "# Rode sua imagem usando:"
+echo "apptainer shell ${MY_APPTAINER_IMAGE}"
+echo "# ou"
+echo "apptainer exec ${MY_APPTAINER_IMAGE} <comando/script que você quer executar>"
+echo ""
+echo "https://kb.uconn.edu/space/SH/26231799924/Get+started+with+Apptainer"
+echo "https://hsf-training.github.io/hsf-training-singularity-webpage/"
+echo ""
+' > build_my_taxila_apptainer_image.bsh
+
+chmod +x ./build_my_taxila_apptainer_image.bsh
+
+./build_my_taxila_apptainer_image.bsh
